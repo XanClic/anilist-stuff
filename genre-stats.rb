@@ -3,6 +3,7 @@
 require 'json'
 require 'net/http'
 require 'net/https'
+require 'nokogiri'
 require 'uri'
 
 
@@ -33,10 +34,10 @@ PREFIX_WEIGHTS = {
 }
 
 
-def die(msg)
+def die(msg, exitcode=1)
     $stderr.puts(msg)
     IO.write('anilist.db', JSON.pretty_generate($db))
-    exit 1
+    exit exitcode
 end
 
 
@@ -154,16 +155,25 @@ def expanded_genres(anime, main_studio_handling)
 end
 
 
+def normalize_title(title)
+    title.gsub(/\p{^Word}/, ' ').gsub(/\s+TV\s*$/, '').gsub(/\s+2nd\s+Season\s*$/, ' 2').gsub(/\s+wo\s+/, ' ')
+end
+
+
 def fetch_genres(user, sess)
     completed_list = sess.get("user/#{user}/animelist")['lists']['completed']
 
+    die('Failed to fetch anime list') unless completed_list
+
     genre_votes = {}
+    seen = []
 
     i = 0
     n = completed_list.length
 
     completed_list.each do |a|
         anime = sess.get("anime/#{a['anime']['id']}/page")
+        seen << a['anime']['id'].to_i
 
         expanded_genres(anime, :duplicate).each do |genre|
             genre_votes[genre] = [] unless genre_votes[genre]
@@ -176,10 +186,98 @@ def fetch_genres(user, sess)
     end
     puts
 
-    genre_votes.map { |g, v|
-        [ g, v.length, v.average, v.sd ]
-    }.sort { |gv1, gv2|
-        gv2[2] <=> gv1[2]
+    {
+        genres: genre_votes.map { |g, v|
+                [ g, v.length, v.average, v.sd ]
+            }.sort { |gv1, gv2|
+                gv2[2] <=> gv1[2]
+            },
+
+        seen: seen
+    }
+end
+
+KNOWN_ID_ALIASES = {
+    19285 => 19285,
+    20039 => 20039,
+    20423 => 20423,
+    22297 => 19603, # F/SN: UBW (ufotable)
+    23277 => 20657, # Saenai Heroine no Sodate-kata
+    27821 => false, # Fate/stay night: Unlimited Blade Works (TV) - Prologue
+    28701 => 20792, # F/SN: UBW (ufotable) 2nd Season
+    29317 => false  # Saenai Heroine no Sodate-kata Episode 0
+}
+
+def fetch_genres_mal(user, sess)
+    resp = Net::HTTP.start('myanimelist.net') do |http|
+        http.get("http://myanimelist.net/malappinfo.php?status=all&type=anime&u=#{user}")
+    end
+
+    die('Failed to fetch anime list') unless resp.is_a?(Net::HTTPSuccess)
+
+    full_list = Nokogiri::Slop(resp.body).myanimelist.anime
+
+    genre_votes = {}
+    seen = []
+
+    i = 0
+    n = full_list.length
+
+    full_list.each do |a|
+        if a.my_status.content == '2'
+            id = a.series_animedb_id.content.to_i
+            known_id = id < 19000 || (KNOWN_ID_ALIASES[id] != nil)
+            if known_id && id >= 19000
+                id = KNOWN_ID_ALIASES[id]
+            end
+
+            anime = nil
+
+            anime = sess.get("anime/#{id}/page") if id
+            if id && !known_id && (!anime || anime['title_romaji'] != a.series_title.content)
+                title = normalize_title(a.series_title.content)
+                begin
+                    anime_list = sess.get("anime/search/#{URI.encode(title)}")
+                rescue
+                    die("Failed to find “#{title}”")
+                end
+                pal = anime_list.select do |ca|
+                    [ca['title_romaji'], ca['title_english'], ca['title_japanese']].include?(a.series_title.content)
+                end
+                if pal.length < 1
+                    pal = anime_list
+                end
+                anime = pal[0]
+                die("Failed to find #{a.series_title.content}") unless anime
+                puts "Auto-mapped “#{a.series_title.content}” -> “#{anime['title_romaji']}” / “#{anime['title_english']}”"
+                id = anime['id'].to_i
+                anime = sess.get("anime/#{id}/page")
+            end
+
+            if anime
+                expanded_genres(anime, :duplicate).each do |genre|
+                    genre_votes[genre] = [] unless genre_votes[genre]
+                    genre_votes[genre] << a.my_score.content.to_f
+                end
+
+                seen << id
+            end
+        end
+
+        i += 1
+        print "#{i}/#{n}\r"
+        $stdout.flush
+    end
+    puts
+
+    {
+        genres: genre_votes.map { |g, v|
+                [ g, v.length, v.average, v.sd ]
+            }.sort { |gv1, gv2|
+                gv2[2] <=> gv1[2]
+            },
+
+        seen: seen
     }
 end
 
@@ -223,16 +321,34 @@ end
 sess = AnilistSession.new($db['client-id'], $db['client-secret']) unless commands[0] == 'help'
 
 if commands[0] != 'help' && (!$db['genres'] || user_changed || options['refresh'])
-    $db['genres'] = fetch_genres($db['user'], sess)
+    ret = nil
+    if options['mal']
+        ret = fetch_genres_mal($db['user'], sess)
+    else
+        ret = fetch_genres($db['user'], sess)
+    end
+    $db['genres'] = ret[:genres]
+    $db['seen'] = ret[:seen]
 end
 
 if commands[0] == 'list'
     puts $db['genres'].map { |gv| "#{gv[0]} (#{gv[1]}): %.2f ±%.2f" % gv[2..3] } * "\n"
 elsif commands[0] == 'recommend'
-    season = commands[1]
+    season_user = commands[1]
     year = commands[2]
 
-    die('Usage: recommend <season> <year>') unless year && season
+    season = user = nil
+    if season_user
+        if year
+            season = season_user
+        else
+            user = season_user
+        end
+    end
+
+    die("Usage: recommend <season> <year>   # recommends anime from that season\n" +
+        "       recommend <user>            # recommends anime that user has completed watching\n" +
+        "       recommend                   # recommends anime from the highscore list", 0) if options['--help']
 
     weighted_genres = {}
     $db['genres'].each do |gv|
@@ -249,7 +365,23 @@ elsif commands[0] == 'recommend'
         weighted_genres[gv[0]] = [gv[2], 1.0 / (1.0 + weighted_sd)]
     end
 
-    list = sess.get('browse/anime', { year: year, season: season, full_page: true })
+    if user
+        list = sess.get("user/#{user}/animelist")['lists']['completed'].map do |a|
+            a['anime']
+        end
+    elsif season && year
+        list = sess.get('browse/anime', { year: year, season: season, full_page: true })
+    else
+        list = sess.get('browse/anime', { sort: 'score-desc', page: 0 }) +
+               sess.get('browse/anime', { sort: 'score-desc', page: 1 }) +
+               sess.get('browse/anime', { sort: 'score-desc', page: 2 })
+    end
+
+    list.uniq!
+
+    if options['new']
+        list.reject! { |a| $db['seen'].include?(a['id'].to_i) }
+    end
 
     i = 0
     n = list.length
