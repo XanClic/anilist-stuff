@@ -281,6 +281,60 @@ def fetch_genres_mal(user, sess)
     }
 end
 
+def eval_anime(sess, id, weighted_genres)
+    full = sess.get("anime/#{id}/page")
+
+    gm = expanded_genres(full, :extra).map { |g| weighted_genres[g] }.select { |ws| ws }
+    if gm.empty?
+        calc_score = -Float::INFINITY
+        weight = 0.0
+        calculation = nil
+    else
+        weight = gm.map { |ws| ws[1] }.inject(:+)
+        calc_score = gm.map { |ws| ws[0] * ws[1] }.inject(:+) / weight
+        calculation = expanded_genres(full, :extra).map { |g|
+            [g, weighted_genres[g]]
+        }.select { |ws| ws[1] }.sort { |ws1, ws2|
+            ws2[1][1] <=> ws1[1][1]
+        }.map { |ws|
+            "#{ws[0]} (%.2f * %.2f)" % [ws[1][0], ws[1][1]]
+        } * ', '
+    end
+
+    title = "#{full['title_romaji']}"
+    if full['title_romaji'] != full['title_english']
+        title += " (#{full['title_english']})"
+    end
+
+    { id:           full['id'],
+      title:        title,
+      avg_score:    full['average_score'],
+      eps:          full['total_episodes'],
+      calc_score:   calc_score,
+      weight:       weight,
+      calculation:  calculation }
+end
+
+def weight_genres(genres)
+    weighted_genres = {}
+
+    genres.each do |gv|
+        prefix = /^[^:]+/.match(gv[0])
+        prefix_weight = PREFIX_WEIGHTS[prefix[0]]
+        prefix_weight = 1.0 unless prefix_weight
+        if prefix == 'Staff'
+            prefix = /^[^:]+:[^:]+/.match(gv[0])
+            prefix_weight = PREFIX_WEIGHTS[prefix[0]] if PREFIX_WEIGHTS[prefix[0]]
+        end
+
+        weighted_sd = gv[3] + 4.0 / gv[1]
+        weighted_sd /= prefix_weight
+        weighted_genres[gv[0]] = [gv[2], 1.0 / (1.0 + weighted_sd)]
+    end
+
+    return weighted_genres
+end
+
 
 options = ARGV.to_a.select { |o| o =~ /^--/ }
 commands = ARGV.to_a - options
@@ -348,24 +402,17 @@ elsif commands[0] == 'recommend'
 
     die("Usage: recommend <season> <year>   # recommends anime from that season\n" +
         "       recommend <user>            # recommends anime that user has completed watching\n" +
+        "                                     (or, if <user> is yourself, something from your\n" +
+        "                                      plan-to-watch list)\n" +
         "       recommend                   # recommends anime from the highscore list", 0) if options['--help']
 
-    weighted_genres = {}
-    $db['genres'].each do |gv|
-        prefix = /^[^:]+/.match(gv[0])
-        prefix_weight = PREFIX_WEIGHTS[prefix[0]]
-        prefix_weight = 1.0 unless prefix_weight
-        if prefix == 'Staff'
-            prefix = /^[^:]+:[^:]+/.match(gv[0])
-            prefix_weight = PREFIX_WEIGHTS[prefix[0]] if PREFIX_WEIGHTS[prefix[0]]
+    weighted_genres = weight_genres($db['genres'])
+
+    if user && user.downcase == $db['user'].downcase
+        list = sess.get("user/#{user}/animelist")['lists']['plan_to_watch'].map do |a|
+            a['anime']
         end
-
-        weighted_sd = gv[3] + 4.0 / gv[1]
-        weighted_sd /= prefix_weight
-        weighted_genres[gv[0]] = [gv[2], 1.0 / (1.0 + weighted_sd)]
-    end
-
-    if user
+    elsif user
         list = sess.get("user/#{user}/animelist")['lists']['completed'].map do |a|
             a['anime']
         end
@@ -387,41 +434,13 @@ elsif commands[0] == 'recommend'
     n = list.length
 
     list.map! { |a|
-        full = sess.get("anime/#{a['id']}/page")
-
-        gm = expanded_genres(full, :extra).map { |g| weighted_genres[g] }.select { |ws| ws }
-        if gm.empty?
-            calc_score = -Float::INFINITY
-            weight = 0.0
-            calculation = nil
-        else
-            weight = gm.map { |ws| ws[1] }.inject(:+)
-            calc_score = gm.map { |ws| ws[0] * ws[1] }.inject(:+) / weight
-            calculation = expanded_genres(full, :extra).map { |g|
-                [g, weighted_genres[g]]
-            }.select { |ws| ws[1] }.sort { |ws1, ws2|
-                ws2[1][1] <=> ws1[1][1]
-            }.map { |ws|
-                "#{ws[0]} (%.2f * %.2f)" % [ws[1][0], ws[1][1]]
-            } * ', '
-        end
+        res = eval_anime(sess, a['id'], weighted_genres)
 
         i += 1
         print "#{i}/#{n}\r"
         $stdout.flush
 
-        title = "#{a['title_romaji']}"
-        if a['title_romaji'] != a['title_english']
-            title += " (#{a['title_english']})"
-        end
-
-        { id:           a['id'],
-          title:        title,
-          avg_score:    a['average_score'],
-          eps:          a['total_episodes'],
-          calc_score:   calc_score,
-          weight:       weight,
-          calculation:  calculation }
+        res
     }
     puts
 
@@ -445,6 +464,22 @@ elsif commands[0] == 'recommend'
             "- C %.2f (w %.1f), A %.2f: #{a[:title]} (#{a[:id]}, #{a[:eps]} episodes)\n  #{a[:calculation]}" % [a[:calc_score], a[:weight], a[:avg_score]]
         } * "\n"
     end
+elsif commands[0] == 'evaluate'
+    anime = commands[1]
+
+    die('Usage: evaluate <anime>') unless anime
+
+    weighted_genres = weight_genres($db['genres'])
+    begin
+        anime_list = sess.get("anime/search/#{URI.encode(anime)}")
+    rescue
+        die("Failed to find “#{anime}”")
+    end
+
+    anime_list.each do |a|
+        res = eval_anime(sess, a['id'], weighted_genres)
+        puts "- C %.2f (w %.1f), A %.2f: #{res[:title]} (#{res[:id]}, #{res[:eps]} episodes)\n  #{res[:calculation]}" % [res[:calc_score], res[:weight], res[:avg_score]]
+    end
 elsif commands[0] == 'help'
     puts 'Global options:'
     puts ' --client-id=...'
@@ -465,6 +500,16 @@ elsif commands[0] == 'help'
     puts ' recommend <season> <year>'
     puts '    Recommands anime from the given season and year, based on the genre'
     puts '    votings'
+    puts
+    puts ' recommend <user>'
+    puts '    Recommends anime that user has completed watching; if it is yourself,'
+    puts '    something from your plan-to-watch list will be recommended'
+    puts
+    puts ' recommend'
+    puts '    Recommends anime from the highscore list'
+    puts
+    puts ' evaluate <anime>'
+    puts '    Evaluates the given specific anime'
 else
     die('Command expected, try "help"')
 end
