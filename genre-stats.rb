@@ -285,12 +285,11 @@ def eval_anime(sess, id, weighted_genres)
     full = sess.get("anime/#{id}/page")
 
     gm = expanded_genres(full, :extra).map { |g| weighted_genres[g] }.select { |ws| ws }
-    if gm.empty?
+    weight = gm.map { |ws| ws[1] }.inject(:+)
+    if weight == 0.0
         calc_score = -Float::INFINITY
-        weight = 0.0
         calculation = nil
     else
-        weight = gm.map { |ws| ws[1] }.inject(:+)
         calc_score = gm.map { |ws| ws[0] * ws[1] }.inject(:+) / weight
         calculation = expanded_genres(full, :extra).map { |g|
             [g, weighted_genres[g]]
@@ -327,9 +326,14 @@ def weight_genres(genres)
             prefix_weight = PREFIX_WEIGHTS[prefix[0]] if PREFIX_WEIGHTS[prefix[0]]
         end
 
-        weighted_sd = gv[3] + 4.0 / gv[1]
-        weighted_sd /= prefix_weight
-        weighted_genres[gv[0]] = [gv[2], 1.0 / (1.0 + weighted_sd)]
+        # Disregard everything with less than three samples
+        if gv[1] >= 3
+            weighted_sd = gv[3] + 4.0 / gv[1]
+            weighted_sd /= prefix_weight
+            weighted_genres[gv[0]] = [gv[2], 1.0 / (1.0 + weighted_sd)]
+        else
+            weighted_genres[gv[0]] = [gv[2], 0.0]
+        end
     end
 
     return weighted_genres
