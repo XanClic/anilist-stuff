@@ -484,6 +484,41 @@ elsif commands[0] == 'evaluate'
         res = eval_anime(sess, a['id'], weighted_genres)
         puts "- C %.2f (w %.1f), A %.2f: #{res[:title]} (#{res[:id]}, #{res[:eps]} episodes)\n  #{res[:calculation]}" % [res[:calc_score], res[:weight], res[:avg_score]]
     end
+elsif commands[0] == 'why'
+    genre = commands[1]
+
+    die('Usage: why <long genre name>') unless genre
+
+    list = sess.get("user/#{$db['user']}/animelist")['lists']['completed']
+
+    i = 0
+    n = list.length
+
+    list.map! do |a|
+        full = sess.get("anime/#{a['anime']['id']}/page")
+
+        i += 1
+        print "#{i}/#{n}\r"
+        $stdout.flush
+
+        [a['anime'], a['score'], full]
+    end
+
+    list.select! do |a|
+        expanded_genres(a[2], :double).find { |g| g.downcase == genre.downcase }
+    end
+
+    list.sort! do |x, y|
+        y[1].to_f <=> x[1].to_f
+    end
+
+    list.each do |a|
+        title = a[2]['title_romaji']
+        if a[2]['title_romaji'] != a[2]['title_english']
+            title += " (#{a[2]['title_english']})"
+        end
+        puts "- #{title}: #{a[1]}"
+    end
 elsif commands[0] == 'help'
     puts 'Global options:'
     puts ' --client-id=...'
@@ -514,6 +549,9 @@ elsif commands[0] == 'help'
     puts
     puts ' evaluate <anime>'
     puts '    Evaluates the given specific anime'
+    puts
+    puts ' why <long genre name>'
+    puts '    Shows all anime and their votings for the given genre'
 else
     die('Command expected, try "help"')
 end
