@@ -131,12 +131,12 @@ def expanded_genres(anime, main_studio_handling)
         end
     }.flatten + anime['staff'].map { |s|
         roles = (s['role'] ? simplified_role(s['role']) : '').split(',').map { |r| r.strip }
-        if s['name_last'].empty? && s['name_first'].empty?
+        if (!s['name_last'] || s['name_last'].empty?) && (!s['name_first'] || s['name_first'].empty?)
             roles = []
             name = nil
-        elsif s['name_last'].empty?
+        elsif !s['name_last'] || s['name_last'].empty?
             name = s['name_first']
-        elsif s['name_first'].empty?
+        elsif !s['name_first'] || s['name_first'].empty?
             name = s['name_last']
         else
             name = "#{s['name_last']}, #{s['name_first']}"
